@@ -1762,8 +1762,8 @@ async def permission_setting(
     )
 
 
-@bot.tree.command(name="ポイント追加", description="メンバーへポイントを追加します")
-@manager_only()
+@bot.tree.command(name="ポイント追加", description="【管理者限定】メンバーへポイントを追加します")
+@app_commands.checks.has_permissions(administrator=True)
 async def admin_add_points(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -1778,8 +1778,8 @@ async def admin_add_points(
     )
 
 
-@bot.tree.command(name="ポイント減少", description="メンバーのポイントを減らします")
-@manager_only()
+@bot.tree.command(name="ポイント減少", description="【管理者限定】メンバーのポイントを減らします")
+@app_commands.checks.has_permissions(administrator=True)
 async def admin_remove_points(
     interaction: discord.Interaction,
     member: discord.Member,
