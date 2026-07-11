@@ -496,33 +496,8 @@ async def notify_level_up(
     new_xp: int,
     channel: Optional[discord.abc.Messageable],
 ):
-    old_level, _, _ = level_from_xp(old_xp)
-    new_level, _, _ = level_from_xp(new_xp)
-
-    if new_level <= old_level:
-        return
-
-    embed = discord.Embed(
-        title="🎉 レベルアップ！",
-        description=(
-            f"{member.mention} が **Lv.{old_level} → Lv.{new_level}** に上がりました！\n"
-            f"新しい称号：**{title_from_level(new_level)}**"
-        ),
-        color=discord.Color.gold(),
-    )
-
-    if channel:
-        try:
-            await channel.send(embed=embed)
-            return
-        except discord.Forbidden:
-            pass
-
-    try:
-        await member.send(embed=embed)
-    except discord.Forbidden:
-        pass
-
+    """レベルアップ通知は無効化されています。"""
+    return
 
 async def award_points(
     member: discord.Member,
@@ -672,7 +647,6 @@ class FloatView(discord.ui.View):
             ),
             color=discord.Color.purple(),
         )
-        embed.add_field(name="現在のポイント", value=f"{points:,} pt")
         await interaction.response.send_message(embed=embed)
 
 
@@ -816,8 +790,7 @@ async def on_voice_state_update(member, before, after):
             await notify_level_up(member, old_xp, new_xp, after.channel)
             try:
                 await member.send(
-                    f"🎉 VC浮上ボーナスとして **{FLOAT_REWARD}ポイント**獲得しました。\n"
-                    f"現在：**{points:,} pt**"
+                    f"🎉 VC浮上ボーナスとして **{FLOAT_REWARD}ポイント**獲得しました。"
                 )
             except discord.Forbidden:
                 pass
@@ -924,7 +897,7 @@ async def float_command(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         f"🌙 {interaction.user.mention} が浮上しました！\n"
-        f"**{FLOAT_REWARD}ポイント**獲得。現在：**{points:,} pt**"
+        f"**{FLOAT_REWARD}ポイント**獲得しました！"
     )
 
 
@@ -964,7 +937,7 @@ async def daily_bonus(interaction: discord.Interaction):
         await notify_level_up(interaction.user, old_xp, new_xp, interaction.channel)
 
     await interaction.response.send_message(
-        f"🎁 **{amount:,}ポイント**獲得しました！\n現在：**{points:,} pt**"
+        f"🎁 **{amount:,}ポイント**獲得しました！"
     )
 
 
