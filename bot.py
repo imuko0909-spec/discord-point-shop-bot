@@ -1192,6 +1192,9 @@ async def shop(
     operation: app_commands.Choice[str],
     item: Optional[app_commands.Choice[str]] = None,
 ):
+    # Discordの3秒制限対策。最初に処理中として応答します。
+    await interaction.response.defer(ephemeral=True)
+
     guild_id = interaction.guild_id or GUILD_ID
 
     if operation.value == "list":
@@ -1212,7 +1215,7 @@ async def shop(
                 inline=False,
             )
 
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed, ephemeral=True)
         return
 
     if operation.value == "inventory":
@@ -1223,7 +1226,7 @@ async def shop(
             for key, data in ITEMS.items()
         ]
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=discord.Embed(
                 title="🎫 所持券一覧",
                 description="\n".join(lines),
@@ -1234,7 +1237,7 @@ async def shop(
         return
 
     if item is None:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "購入または使用する商品・券も選択してください。",
             ephemeral=True,
         )
@@ -1252,7 +1255,7 @@ async def shop(
         )
 
         if not success:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"ポイント不足です。\n"
                 f"必要：**{price:,} pt**\n"
                 f"所持：**{remaining:,} pt**",
@@ -1262,7 +1265,7 @@ async def shop(
 
         await db.add_item(interaction.user.id, key)
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ {data['emoji']} **{data['name']}** を購入しました。\n"
             f"残り：**{remaining:,} pt**",
             ephemeral=True,
@@ -1281,7 +1284,7 @@ async def shop(
 
     # operation == use
     if await db.get_item_quantity(interaction.user.id, key) <= 0:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"{data['name']}を所持していません。",
             ephemeral=True,
         )
@@ -1289,7 +1292,7 @@ async def shop(
 
     if key == "topic":
         await db.consume_item(interaction.user.id, key)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=discord.Embed(
                 title="🎲 話題ガチャ",
                 description=f"## {random.choice(TOPICS)}",
@@ -1299,7 +1302,6 @@ async def shop(
         return
 
     if key == "private_room":
-        await interaction.response.defer(ephemeral=True)
         success, message = await create_private_room(interaction)
 
         if not success:
@@ -1311,7 +1313,7 @@ async def shop(
         return
 
     if key == "game_role":
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "付与するゲームロールを選択してください。",
             view=GameRoleView(interaction.user.id),
             ephemeral=True,
@@ -1323,7 +1325,7 @@ async def shop(
             interaction.user,
             discord.Member,
         ):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "サーバー内で使用してください。",
                 ephemeral=True,
             )
@@ -1331,7 +1333,7 @@ async def shop(
 
         role = interaction.guild.get_role(SECRET_ROLE_ID)
         if role is None:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "シークレットロールが見つかりません。",
                 ephemeral=True,
             )
@@ -1345,7 +1347,7 @@ async def shop(
                 reason="シークレット券を使用",
             )
         except discord.Forbidden:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Botのロールをシークレットロールより上にしてください。",
                 ephemeral=True,
             )
@@ -1359,7 +1361,7 @@ async def shop(
             expires_at,
         )
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             (
                 f"🕯️ {role.mention} を付与しました。\n"
                 f"有効期限：<t:{int(expires_at.timestamp())}:F>\n"
@@ -1380,7 +1382,7 @@ async def shop(
         return
 
     if key == "date":
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "デート券は `/デート券を使う` から相手を選んで使用してください。",
             ephemeral=True,
         )
@@ -2015,10 +2017,14 @@ async def command_error(
         message = f"エラーが発生しました：`{type(error).__name__}`"
         print(repr(error), flush=True)
 
-    if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
-    else:
-        await interaction.response.send_message(message, ephemeral=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.NotFound:
+        # 操作が期限切れの場合は、追加の返答を送らずログだけ残します。
+        print("Interaction expired before error response could be sent.", flush=True)
 
 
 if not TOKEN:
