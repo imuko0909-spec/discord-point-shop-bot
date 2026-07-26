@@ -794,13 +794,26 @@ class PointShopBot(commands.Bot):
         self.add_view(FloatView())
 
         guild = discord.Object(id=GUILD_ID)
+
+        # 現在のコードにあるコマンドを指定サーバーへコピーします。
+        self.tree.clear_commands(guild=guild)
         self.tree.copy_global_to(guild=guild)
-        synced = await self.tree.sync(guild=guild)
+        synced_guild = await self.tree.sync(guild=guild)
+
+        # 過去に登録されたグローバルコマンドを削除します。
+        # Discord上で同じコマンドが二重表示されるのを防ぎます。
+        self.tree.clear_commands(guild=None)
+        synced_global = await self.tree.sync()
 
         print(f"[SYNC] Guild ID: {GUILD_ID}", flush=True)
-        print(f"[SYNC] Command count: {len(synced)}", flush=True)
+        print(f"[SYNC] Guild command count: {len(synced_guild)}", flush=True)
         print(
-            "[SYNC] Commands: " + ", ".join(command.name for command in synced),
+            "[SYNC] Guild commands: "
+            + ", ".join(command.name for command in synced_guild),
+            flush=True,
+        )
+        print(
+            f"[SYNC] Global command count after cleanup: {len(synced_global)}",
             flush=True,
         )
 
