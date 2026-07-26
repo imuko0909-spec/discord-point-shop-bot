@@ -30,7 +30,7 @@ DEFAULT_VC_POINTS = int(os.getenv("VC_POINTS_PER_INTERVAL", "10"))
 
 PRIVATE_ROOM_CATEGORY_ID = int(os.getenv("PRIVATE_ROOM_CATEGORY_ID", "0") or 0)
 PRIVATE_ROOM_DEFAULT_LIMIT = 0  # 0 = 無制限
-SECRET_ROLE_ID = int(os.getenv("SECRET_ROLE_ID", "0") or 0)
+SECRET_ROLE_ID = 1530733623412654230
 
 DAILY_BONUS_MIN = int(os.getenv("DAILY_BONUS_MIN", "80"))
 DAILY_BONUS_MAX = int(os.getenv("DAILY_BONUS_MAX", "150"))
@@ -153,6 +153,16 @@ class Database:
                 channel_id INTEGER PRIMARY KEY,
                 guild_id INTEGER NOT NULL,
                 owner_id INTEGER NOT NULL
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS timed_roles (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role_id INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id, role_id)
             )
         """)
 
@@ -403,6 +413,45 @@ class Database:
                 "SELECT channel_id, owner_id FROM private_rooms WHERE guild_id = ?",
                 (guild_id,),
             ).fetchall()
+
+    async def save_timed_role(
+        self,
+        guild_id: int,
+        user_id: int,
+        role_id: int,
+        expires_at: datetime,
+    ):
+        async with self.lock:
+            self.conn.execute("""
+                INSERT INTO timed_roles (guild_id, user_id, role_id, expires_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id, role_id)
+                DO UPDATE SET expires_at = excluded.expires_at
+            """, (guild_id, user_id, role_id, expires_at.isoformat()))
+            self.conn.commit()
+
+    async def get_expired_timed_roles(self, now: datetime):
+        async with self.lock:
+            return self.conn.execute(
+                """SELECT guild_id, user_id, role_id, expires_at
+                   FROM timed_roles
+                   WHERE expires_at <= ?""",
+                (now.isoformat(),),
+            ).fetchall()
+
+    async def delete_timed_role(
+        self,
+        guild_id: int,
+        user_id: int,
+        role_id: int,
+    ):
+        async with self.lock:
+            self.conn.execute(
+                """DELETE FROM timed_roles
+                   WHERE guild_id = ? AND user_id = ? AND role_id = ?""",
+                (guild_id, user_id, role_id),
+            )
+            self.conn.commit()
 
 
 db = Database(DATABASE_PATH)
@@ -764,6 +813,9 @@ async def on_ready():
     if not vc_reward_loop.is_running():
         vc_reward_loop.start()
 
+    if not timed_role_cleanup_loop.is_running():
+        timed_role_cleanup_loop.start()
+
     guild = bot.get_guild(GUILD_ID)
     if guild:
         rows = await db.get_private_rooms(guild.id)
@@ -833,10 +885,18 @@ async def vc_reward_loop():
         )
 
         for channel in guild.voice_channels:
-            for member in channel.members:
-                if member.bot:
-                    continue
+            human_members = [
+                member for member in channel.members
+                if not member.bot
+            ]
 
+            # Botを除く2人以上が揃っているVCだけポイント対象
+            if len(human_members) < 2:
+                for member in human_members:
+                    vc_minutes.pop((guild.id, member.id), None)
+                continue
+
+            for member in human_members:
                 key = (guild.id, member.id)
                 active.add(key)
                 vc_minutes[key] = vc_minutes.get(key, 0) + 1
@@ -847,7 +907,7 @@ async def vc_reward_loop():
                         await award_points(
                             member,
                             reward,
-                            f"VC滞在ボーナス（{interval}分）",
+                            f"VC滞在ボーナス（{interval}分・2人以上）",
                             channel,
                         )
 
@@ -858,6 +918,47 @@ async def vc_reward_loop():
 
 @vc_reward_loop.before_loop
 async def before_vc_loop():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=1)
+async def timed_role_cleanup_loop():
+    """期限切れのシークレットロールを自動で剥奪します。"""
+    now = datetime.now(timezone.utc)
+    rows = await db.get_expired_timed_roles(now)
+
+    for row in rows:
+        guild_id = int(row["guild_id"])
+        user_id = int(row["user_id"])
+        role_id = int(row["role_id"])
+
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            continue
+
+        role = guild.get_role(role_id)
+        member = guild.get_member(user_id)
+
+        if role is not None and member is not None:
+            try:
+                await member.remove_roles(
+                    role,
+                    reason="シークレット券の有効期限24時間が終了",
+                )
+                await send_log(
+                    guild,
+                    "🕯️ シークレットロール自動剥奪",
+                    f"対象：{member.mention}\nロール：{role.mention}",
+                )
+            except discord.Forbidden:
+                # 権限不足の場合は次回も再試行
+                continue
+
+        await db.delete_timed_role(guild_id, user_id, role_id)
+
+
+@timed_role_cleanup_loop.before_loop
+async def before_timed_role_cleanup_loop():
     await bot.wait_until_ready()
 
 
@@ -1069,96 +1170,119 @@ def item_choices():
     ]
 
 
-@bot.tree.command(name="ショップ", description="ショップを表示します")
-async def shop(interaction: discord.Interaction):
-    guild_id = interaction.guild_id or GUILD_ID
-
-    embed = discord.Embed(
-        title="🛍️ ポイントショップ",
-        description="購入は `/購入` から行えます。",
-        color=discord.Color.purple(),
-    )
-
-    for key, data in ITEMS.items():
-        price = await get_item_price(guild_id, key)
-        embed.add_field(
-            name=f"{data['emoji']} {data['name']} — {price:,} pt",
-            value=data["description"],
-            inline=False,
-        )
-
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="購入", description="商品を購入します")
-@app_commands.choices(item=item_choices())
-async def buy(
+@bot.tree.command(
+    name="ショップ",
+    description="商品一覧・購入・券一覧・券の使用を行います",
+)
+@app_commands.choices(
+    operation=[
+        app_commands.Choice(name="🛍️ 商品一覧を見る", value="list"),
+        app_commands.Choice(name="💰 商品を購入する", value="buy"),
+        app_commands.Choice(name="🎫 所持券を見る", value="inventory"),
+        app_commands.Choice(name="✨ 券を使う", value="use"),
+    ],
+    item=item_choices(),
+)
+@app_commands.describe(
+    operation="行いたい操作",
+    item="購入または使用する商品・券",
+)
+async def shop(
     interaction: discord.Interaction,
-    item: app_commands.Choice[str],
+    operation: app_commands.Choice[str],
+    item: Optional[app_commands.Choice[str]] = None,
 ):
     guild_id = interaction.guild_id or GUILD_ID
-    item_key = item.value
-    data = ITEMS[item_key]
-    price = await get_item_price(guild_id, item_key)
 
-    success, remaining = await db.take_points(
-        interaction.user.id,
-        price,
-        f"{data['name']}を購入",
-    )
+    if operation.value == "list":
+        embed = discord.Embed(
+            title="🛍️ ポイントショップ",
+            description=(
+                "`/ショップ`をもう一度使い、"
+                "「商品を購入する」または「券を使う」を選んでください。"
+            ),
+            color=discord.Color.purple(),
+        )
 
-    if not success:
+        for key, data in ITEMS.items():
+            price = await get_item_price(guild_id, key)
+            embed.add_field(
+                name=f"{data['emoji']} {data['name']} — {price:,} pt",
+                value=data["description"],
+                inline=False,
+            )
+
+        await interaction.response.send_message(embed=embed)
+        return
+
+    if operation.value == "inventory":
+        inventory_data = await db.get_inventory(interaction.user.id)
+        lines = [
+            f"{data['emoji']} **{data['name']}**："
+            f"{inventory_data.get(key, 0)}枚"
+            for key, data in ITEMS.items()
+        ]
+
         await interaction.response.send_message(
-            f"ポイント不足です。\n必要：**{price:,} pt**\n所持：**{remaining:,} pt**",
+            embed=discord.Embed(
+                title="🎫 所持券一覧",
+                description="\n".join(lines),
+                color=discord.Color.blurple(),
+            ),
             ephemeral=True,
         )
         return
 
-    await db.add_item(interaction.user.id, item_key)
+    if item is None:
+        await interaction.response.send_message(
+            "購入または使用する商品・券も選択してください。",
+            ephemeral=True,
+        )
+        return
 
-    await interaction.response.send_message(
-        f"✅ {data['emoji']} **{data['name']}** を購入しました。\n"
-        f"残り：**{remaining:,} pt**",
-        ephemeral=True,
-    )
-
-    await send_log(
-        interaction.guild,
-        "🛍️ ショップ購入",
-        f"購入者：{interaction.user.mention}\n商品：{data['name']}\n価格：{price:,}pt",
-    )
-
-
-@bot.tree.command(name="券一覧", description="所持している券を表示します")
-async def inventory(interaction: discord.Interaction):
-    inventory_data = await db.get_inventory(interaction.user.id)
-
-    lines = [
-        f"{data['emoji']} **{data['name']}**：{inventory_data.get(key, 0)}枚"
-        for key, data in ITEMS.items()
-    ]
-
-    await interaction.response.send_message(
-        embed=discord.Embed(
-            title="🎫 所持券一覧",
-            description="\n".join(lines),
-            color=discord.Color.blurple(),
-        ),
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="券を使う", description="所持している券を使用します")
-@app_commands.choices(item=item_choices())
-async def use_ticket(
-    interaction: discord.Interaction,
-    item: app_commands.Choice[str],
-):
     key = item.value
+    data = ITEMS[key]
 
+    if operation.value == "buy":
+        price = await get_item_price(guild_id, key)
+        success, remaining = await db.take_points(
+            interaction.user.id,
+            price,
+            f"{data['name']}を購入",
+        )
+
+        if not success:
+            await interaction.response.send_message(
+                f"ポイント不足です。\n"
+                f"必要：**{price:,} pt**\n"
+                f"所持：**{remaining:,} pt**",
+                ephemeral=True,
+            )
+            return
+
+        await db.add_item(interaction.user.id, key)
+
+        await interaction.response.send_message(
+            f"✅ {data['emoji']} **{data['name']}** を購入しました。\n"
+            f"残り：**{remaining:,} pt**",
+            ephemeral=True,
+        )
+
+        await send_log(
+            interaction.guild,
+            "🛍️ ショップ購入",
+            (
+                f"購入者：{interaction.user.mention}\n"
+                f"商品：{data['name']}\n"
+                f"価格：{price:,}pt"
+            ),
+        )
+        return
+
+    # operation == use
     if await db.get_item_quantity(interaction.user.id, key) <= 0:
         await interaction.response.send_message(
-            f"{ITEMS[key]['name']}を所持していません。",
+            f"{data['name']}を所持していません。",
             ephemeral=True,
         )
         return
@@ -1195,30 +1319,63 @@ async def use_ticket(
         return
 
     if key == "secret":
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        if interaction.guild is None or not isinstance(
+            interaction.user,
+            discord.Member,
+        ):
+            await interaction.response.send_message(
+                "サーバー内で使用してください。",
+                ephemeral=True,
+            )
             return
 
         role = interaction.guild.get_role(SECRET_ROLE_ID)
         if role is None:
             await interaction.response.send_message(
-                "シークレットロールが未設定です。",
+                "シークレットロールが見つかりません。",
                 ephemeral=True,
             )
             return
 
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+
         try:
-            await interaction.user.add_roles(role, reason="シークレット券")
+            await interaction.user.add_roles(
+                role,
+                reason="シークレット券を使用",
+            )
         except discord.Forbidden:
             await interaction.response.send_message(
-                "Botのロールを対象ロールより上にしてください。",
+                "Botのロールをシークレットロールより上にしてください。",
                 ephemeral=True,
             )
             return
 
         await db.consume_item(interaction.user.id, key)
+        await db.save_timed_role(
+            interaction.guild.id,
+            interaction.user.id,
+            role.id,
+            expires_at,
+        )
+
         await interaction.response.send_message(
-            f"🕯️ **{role.name}** を付与しました。",
+            (
+                f"🕯️ {role.mention} を付与しました。\n"
+                f"有効期限：<t:{int(expires_at.timestamp())}:F>\n"
+                f"期限まで：<t:{int(expires_at.timestamp())}:R>"
+            ),
             ephemeral=True,
+        )
+
+        await send_log(
+            interaction.guild,
+            "🕯️ シークレット券使用",
+            (
+                f"使用者：{interaction.user.mention}\n"
+                f"ロール：{role.mention}\n"
+                f"期限：<t:{int(expires_at.timestamp())}:F>"
+            ),
         )
         return
 
