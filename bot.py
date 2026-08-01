@@ -5,6 +5,7 @@ import shutil
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -2061,43 +2062,47 @@ async def settings_view(interaction: discord.Interaction):
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def database_backup(interaction: discord.Interaction):
-    # Discordへ最優先で1回だけ応答
-    await interaction.response.send_message(
-        "💾 **SQLiteバックアップを開始しました…**",
-        ephemeral=True,
-    )
+    # まずDiscordへ受理だけ返す
+    await interaction.response.defer(ephemeral=True)
 
-    print("[DB BACKUP] 1/2 バックアップ開始", flush=True)
+    print("[DB BACKUP] 1/3 開始", flush=True)
+    print(f"[DB BACKUP] DB PATH: {DATABASE_PATH}", flush=True)
+    print(f"[DB BACKUP] BACKUP PATH: {BACKUP_DATABASE_PATH}", flush=True)
 
     try:
+        backup_file = Path(BACKUP_DATABASE_PATH)
+        backup_file.parent.mkdir(parents=True, exist_ok=True)
+
+        print(
+            f"[DB BACKUP] parent exists={backup_file.parent.exists()} "
+            f"writable={os.access(backup_file.parent, os.W_OK)}",
+            flush=True,
+        )
+
+        print("[DB BACKUP] 2/3 SQLiteコピー開始", flush=True)
         await db.create_backup(BACKUP_DATABASE_PATH)
 
-        backup_file = Path(BACKUP_DATABASE_PATH)
+        print("[DB BACKUP] 3/3 完了", flush=True)
+
         size = backup_file.stat().st_size
         updated_at = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
 
-        print("[DB BACKUP] 2/2 バックアップ完了", flush=True)
-
-        try:
-            await interaction.edit_original_response(
-                content=(
-                    "✅ **SQLiteバックアップが完了しました。**\n"
-                    f"保存先：`{BACKUP_DATABASE_PATH}`\n"
-                    f"サイズ：**{size / 1024:.1f} KB**\n"
-                    f"保存日時：**{updated_at}**"
-                )
-            )
-        except discord.HTTPException as response_error:
-            print(
-                f"[DB BACKUP RESPONSE ERROR] {response_error}",
-                flush=True,
-            )
+        await interaction.followup.send(
+            (
+                "✅ **SQLiteバックアップが完了しました。**\n"
+                f"保存先：`{BACKUP_DATABASE_PATH}`\n"
+                f"サイズ：**{size / 1024:.1f} KB**\n"
+                f"保存日時：**{updated_at}**"
+            ),
+            ephemeral=True,
+        )
 
     except asyncio.TimeoutError:
         print("[DB BACKUP ERROR] TimeoutError", flush=True)
         try:
-            await interaction.edit_original_response(
-                content="❌ バックアップ処理が60秒を超えたため中止しました。"
+            await interaction.followup.send(
+                "❌ バックアップ処理が60秒を超えたため中止しました。",
+                ephemeral=True,
             )
         except discord.HTTPException:
             pass
@@ -2108,11 +2113,12 @@ async def database_backup(interaction: discord.Interaction):
             flush=True,
         )
         try:
-            await interaction.edit_original_response(
-                content=(
+            await interaction.followup.send(
+                (
                     "❌ **バックアップに失敗しました。**\n"
                     f"`{type(error).__name__}: {error}`"
-                )
+                ),
+                ephemeral=True,
             )
         except discord.HTTPException:
             pass
