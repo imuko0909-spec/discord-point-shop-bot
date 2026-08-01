@@ -19,6 +19,10 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 GUILD_ID = 977609950706679859
 DATABASE_PATH = os.getenv("DATABASE_PATH", "point_shop.db")
+BACKUP_DATABASE_PATH = os.getenv(
+    "BACKUP_DATABASE_PATH",
+    "/data/backups/point_shop_backup.db",
+)
 
 JST = timezone(timedelta(hours=9))
 
@@ -413,6 +417,35 @@ class Database:
                 "SELECT channel_id, owner_id FROM private_rooms WHERE guild_id = ?",
                 (guild_id,),
             ).fetchall()
+
+
+    async def create_backup(self, backup_path: str):
+        """動作中SQLiteを安全にバックアップします。"""
+        backup_file = Path(backup_path)
+        backup_file.parent.mkdir(parents=True, exist_ok=True)
+
+        async with self.lock:
+            self.conn.commit()
+            backup_conn = sqlite3.connect(str(backup_file))
+            try:
+                self.conn.backup(backup_conn)
+                backup_conn.commit()
+            finally:
+                backup_conn.close()
+
+    async def restore_backup(self, backup_path: str):
+        """バックアップSQLiteを動作中DBへ復元します。"""
+        backup_file = Path(backup_path)
+        if not backup_file.exists():
+            raise FileNotFoundError(str(backup_file))
+
+        async with self.lock:
+            source_conn = sqlite3.connect(str(backup_file))
+            try:
+                source_conn.backup(self.conn)
+                self.conn.commit()
+            finally:
+                source_conn.close()
 
     async def save_timed_role(
         self,
@@ -1996,6 +2029,112 @@ async def settings_view(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+
+@bot.tree.command(
+    name="dbバックアップ",
+    description="【管理者限定】SQLiteデータを永続バックアップへ保存します",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def database_backup(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await db.create_backup(BACKUP_DATABASE_PATH)
+        backup_file = Path(BACKUP_DATABASE_PATH)
+        size = backup_file.stat().st_size if backup_file.exists() else 0
+        updated_at = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
+
+        await interaction.followup.send(
+            (
+                "✅ **SQLiteバックアップが完了しました。**\n"
+                f"保存先：`{BACKUP_DATABASE_PATH}`\n"
+                f"サイズ：**{size / 1024:.1f} KB**\n"
+                f"保存日時：**{updated_at}**"
+            ),
+            ephemeral=True,
+        )
+    except Exception as error:
+        await interaction.followup.send(
+            f"❌ バックアップに失敗しました。\n`{type(error).__name__}: {error}`",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="db復元",
+    description="【管理者限定】保存済みバックアップを動作中SQLiteへ反映します",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def database_restore(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    backup_file = Path(BACKUP_DATABASE_PATH)
+    if not backup_file.exists():
+        await interaction.followup.send(
+            (
+                "❌ バックアップデータが見つかりません。\n"
+                f"確認先：`{BACKUP_DATABASE_PATH}`"
+            ),
+            ephemeral=True,
+        )
+        return
+
+    emergency_path = f"{DATABASE_PATH}.before_restore"
+
+    try:
+        await db.create_backup(emergency_path)
+        await db.restore_backup(BACKUP_DATABASE_PATH)
+
+        await interaction.followup.send(
+            (
+                "✅ **バックアップデータを復元しました。**\n"
+                "ポイント・券・設定などがバックアップ時点へ戻りました。\n"
+                f"復元前DBは一時的に `{emergency_path}` へ退避しています。"
+            ),
+            ephemeral=True,
+        )
+    except Exception as error:
+        await interaction.followup.send(
+            f"❌ 復元に失敗しました。\n`{type(error).__name__}: {error}`",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="dbバックアップ確認",
+    description="【管理者限定】保存済みバックアップの状態を確認します",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def database_backup_status(interaction: discord.Interaction):
+    backup_file = Path(BACKUP_DATABASE_PATH)
+
+    if not backup_file.exists():
+        await interaction.response.send_message(
+            (
+                "バックアップはまだありません。\n"
+                f"保存予定先：`{BACKUP_DATABASE_PATH}`"
+            ),
+            ephemeral=True,
+        )
+        return
+
+    stat = backup_file.stat()
+    modified = datetime.fromtimestamp(
+        stat.st_mtime,
+        tz=timezone.utc,
+    ).astimezone(JST)
+
+    await interaction.response.send_message(
+        (
+            "💾 **バックアップ状態**\n"
+            f"保存先：`{BACKUP_DATABASE_PATH}`\n"
+            f"サイズ：**{stat.st_size / 1024:.1f} KB**\n"
+            f"最終更新：**{modified.strftime('%Y/%m/%d %H:%M:%S')}**"
+        ),
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="管理パネル", description="管理コマンド一覧を表示します")
 @manager_only()
 async def admin_panel(interaction: discord.Interaction):
@@ -2010,6 +2149,9 @@ async def admin_panel(interaction: discord.Interaction):
                 "`/権限設定`\n"
                 "`/ポイント追加`\n"
                 "`/ポイント減少`\n"
+                "`/dbバックアップ`\n"
+                "`/db復元`\n"
+                "`/dbバックアップ確認`\n"
                 "`/浮上パネル`\n"
                 "`/設定確認`"
             ),
