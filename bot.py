@@ -173,6 +173,14 @@ class Database:
             )
         """)
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS vc_reward_channels (
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, channel_id)
+            )
+        """)
+
         self.conn.commit()
 
     async def ensure_user(self, user_id: int):
@@ -420,6 +428,35 @@ class Database:
                 "SELECT channel_id, owner_id FROM private_rooms WHERE guild_id = ?",
                 (guild_id,),
             ).fetchall()
+
+    async def add_vc_reward_channel(self, guild_id: int, channel_id: int):
+        async with self.lock:
+            self.conn.execute(
+                """INSERT OR IGNORE INTO vc_reward_channels (guild_id, channel_id)
+                   VALUES (?, ?)""",
+                (guild_id, channel_id),
+            )
+            self.conn.commit()
+
+    async def remove_vc_reward_channel(self, guild_id: int, channel_id: int):
+        async with self.lock:
+            self.conn.execute(
+                """DELETE FROM vc_reward_channels
+                   WHERE guild_id = ? AND channel_id = ?""",
+                (guild_id, channel_id),
+            )
+            self.conn.commit()
+
+    async def get_vc_reward_channels(self, guild_id: int):
+        async with self.lock:
+            rows = self.conn.execute(
+                """SELECT channel_id
+                   FROM vc_reward_channels
+                   WHERE guild_id = ?
+                   ORDER BY channel_id""",
+                (guild_id,),
+            ).fetchall()
+            return [int(row["channel_id"]) for row in rows]
 
 
     async def create_backup(self, backup_path: str):
@@ -982,6 +1019,25 @@ async def on_ready():
 
     guild = bot.get_guild(GUILD_ID)
     if guild:
+        # 初回のみ、指定名のVCをポイント対象として自動登録します。
+        configured_vcs = await db.get_vc_reward_channels(guild.id)
+        if not configured_vcs:
+            default_names = {"フリル", "まったり", "ねおち"}
+            for channel in guild.voice_channels:
+                if channel.name.strip() in default_names:
+                    await db.add_vc_reward_channel(guild.id, channel.id)
+
+            configured_vcs = await db.get_vc_reward_channels(guild.id)
+            print(
+                "[VC REWARD] 初期対象VC: "
+                + ", ".join(
+                    guild.get_channel(channel_id).name
+                    for channel_id in configured_vcs
+                    if isinstance(guild.get_channel(channel_id), discord.VoiceChannel)
+                ),
+                flush=True,
+            )
+
         rows = await db.get_private_rooms(guild.id)
         for row in rows:
             channel = guild.get_channel(int(row["channel_id"]))
@@ -1048,13 +1104,23 @@ async def vc_reward_loop():
             ),
         )
 
+        reward_channel_ids = set(
+            await db.get_vc_reward_channels(guild.id)
+        )
+
         for channel in guild.voice_channels:
             human_members = [
                 member for member in channel.members
                 if not member.bot
             ]
 
-            # Botを除く2人以上が揃っているVCだけポイント対象
+            # 管理者が指定したVC以外ではポイントを加算しない
+            if channel.id not in reward_channel_ids:
+                for member in human_members:
+                    vc_minutes.pop((guild.id, member.id), None)
+                continue
+
+            # Botを除く2人以上が揃っているときだけポイント対象
             if len(human_members) < 2:
                 for member in human_members:
                     vc_minutes.pop((guild.id, member.id), None)
@@ -1071,7 +1137,10 @@ async def vc_reward_loop():
                         await award_points(
                             member,
                             reward,
-                            f"VC滞在ボーナス（{interval}分・2人以上）",
+                            (
+                                f"VC滞在ボーナス"
+                                f"（{channel.name} / {interval}分・2人以上）"
+                            ),
                             channel,
                         )
 
@@ -1941,6 +2010,120 @@ async def room_management(interaction: discord.Interaction):
 # ============================================================
 
 
+@bot.tree.command(
+    name="ポイントvc追加",
+    description="【管理者限定】VCポイントが付く部屋を追加します",
+)
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(channel="ポイント付与対象にするVC")
+async def vc_reward_channel_add(
+    interaction: discord.Interaction,
+    channel: discord.VoiceChannel,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
+    current = await db.get_vc_reward_channels(interaction.guild.id)
+    if channel.id in current:
+        await interaction.response.send_message(
+            f"ℹ️ **{channel.name}** はすでにポイント対象です。",
+            ephemeral=True,
+        )
+        return
+
+    await db.add_vc_reward_channel(interaction.guild.id, channel.id)
+    await interaction.response.send_message(
+        f"✅ **{channel.name}** をVCポイント対象に追加しました。",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="ポイントvc削除",
+    description="【管理者限定】VCポイントが付く部屋を対象外にします",
+)
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(channel="ポイント付与対象から外すVC")
+async def vc_reward_channel_remove(
+    interaction: discord.Interaction,
+    channel: discord.VoiceChannel,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
+    current = await db.get_vc_reward_channels(interaction.guild.id)
+    if channel.id not in current:
+        await interaction.response.send_message(
+            f"ℹ️ **{channel.name}** はポイント対象ではありません。",
+            ephemeral=True,
+        )
+        return
+
+    await db.remove_vc_reward_channel(interaction.guild.id, channel.id)
+
+    # 削除したVCでカウント中だった時間もリセット
+    for member in channel.members:
+        if not member.bot:
+            vc_minutes.pop((interaction.guild.id, member.id), None)
+
+    await interaction.response.send_message(
+        f"✅ **{channel.name}** をVCポイント対象から外しました。",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="ポイントvc一覧",
+    description="【管理者限定】VCポイント対象の部屋を確認します",
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def vc_reward_channel_list(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
+    channel_ids = await db.get_vc_reward_channels(interaction.guild.id)
+    channels = [
+        interaction.guild.get_channel(channel_id)
+        for channel_id in channel_ids
+    ]
+    channels = [
+        channel for channel in channels
+        if isinstance(channel, discord.VoiceChannel)
+    ]
+
+    if not channels:
+        description = "現在、VCポイント対象の部屋はありません。"
+    else:
+        description = "\n".join(
+            f"🎤 {channel.mention}（{channel.name}）"
+            for channel in channels
+        )
+
+    embed = discord.Embed(
+        title="🎤 VCポイント対象一覧",
+        description=description,
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="対象VCでもBot以外が2人以上いる時だけ加算されます。")
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="vcポイント設定", description="VCポイントの設定を変更します")
 @manager_only()
 async def vc_setting(
@@ -1977,9 +2160,22 @@ async def vc_setting_view(interaction: discord.Interaction):
 
     hourly = 60 / interval * points
 
+    target_ids = await db.get_vc_reward_channels(guild_id)
+    target_names = []
+
+    if interaction.guild:
+        for channel_id in target_ids:
+            channel = interaction.guild.get_channel(channel_id)
+            if isinstance(channel, discord.VoiceChannel):
+                target_names.append(channel.name)
+
+    target_text = "、".join(target_names) if target_names else "未設定"
+
     await interaction.response.send_message(
         f"🎤 **{interval}分ごとに{points:,}pt**\n"
-        f"1時間の目安：**約{hourly:,.1f}pt**",
+        f"1時間の目安：**約{hourly:,.1f}pt**\n"
+        f"対象VC：**{target_text}**\n"
+        "※ Bot以外が2人以上いる時だけ加算",
         ephemeral=True,
     )
 
@@ -2314,6 +2510,9 @@ async def admin_panel(interaction: discord.Interaction):
             title="⚙️ Bot管理パネル",
             description=(
                 "`/vcポイント設定`\n"
+                "`/ポイントvc追加`\n"
+                "`/ポイントvc削除`\n"
+                "`/ポイントvc一覧`\n"
                 "`/ショップ価格設定`\n"
                 "`/ガチャ設定`\n"
                 "`/ログチャンネル設定`\n"
