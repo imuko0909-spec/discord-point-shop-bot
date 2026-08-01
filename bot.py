@@ -423,30 +423,45 @@ class Database:
 
 
     async def create_backup(self, backup_path: str):
-        """動作中SQLiteを別スレッドで安全にバックアップします。"""
+        """通常コマンドを止めずにSQLiteを安全にバックアップします。"""
         backup_file = Path(backup_path)
         backup_file.parent.mkdir(parents=True, exist_ok=True)
 
+        # commitだけ短時間ロック
         async with self.lock:
             self.conn.commit()
 
-            def _backup():
-                source_conn = sqlite3.connect(self.path, timeout=30)
-                destination_conn = sqlite3.connect(str(backup_file), timeout=30)
-                try:
-                    source_conn.backup(destination_conn)
-                    destination_conn.commit()
-                finally:
-                    destination_conn.close()
-                    source_conn.close()
-
-            await asyncio.wait_for(
-                asyncio.to_thread(_backup),
-                timeout=60,
+        def _backup():
+            source_conn = sqlite3.connect(
+                self.path,
+                timeout=10,
+                check_same_thread=False,
             )
+            destination_conn = sqlite3.connect(
+                str(backup_file),
+                timeout=10,
+                check_same_thread=False,
+            )
+            try:
+                source_conn.execute("PRAGMA busy_timeout = 10000")
+                destination_conn.execute("PRAGMA busy_timeout = 10000")
+                source_conn.backup(
+                    destination_conn,
+                    pages=128,
+                    sleep=0.05,
+                )
+                destination_conn.commit()
+            finally:
+                destination_conn.close()
+                source_conn.close()
+
+        await asyncio.wait_for(
+            asyncio.to_thread(_backup),
+            timeout=30,
+        )
 
     async def restore_backup(self, backup_path: str):
-        """バックアップDBを別スレッドで現在DBへ安全に復元します。"""
+        """バックアップDBを現在DBへ復元します。"""
         backup_file = Path(backup_path)
         if not backup_file.exists():
             raise FileNotFoundError(str(backup_file))
@@ -455,20 +470,20 @@ class Database:
             self.conn.commit()
             self.conn.close()
 
-            def _restore():
-                # copy2でバックアップファイル自体は残したまま現在DBへ反映
-                shutil.copy2(str(backup_file), self.path)
-
             try:
                 await asyncio.wait_for(
-                    asyncio.to_thread(_restore),
-                    timeout=60,
+                    asyncio.to_thread(
+                        shutil.copy2,
+                        str(backup_file),
+                        self.path,
+                    ),
+                    timeout=30,
                 )
             finally:
                 self.conn = sqlite3.connect(
                     self.path,
                     check_same_thread=False,
-                    timeout=30,
+                    timeout=10,
                 )
                 self.conn.row_factory = sqlite3.Row
                 self.setup()
@@ -1974,9 +1989,11 @@ async def admin_add_points(
     amount: app_commands.Range[int, 1, 1000000],
     reason: str = "管理者による付与",
 ):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     total = await award_points(member, amount, reason, interaction.channel)
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ {member.mention}へ**{amount:,}pt**追加しました。\n現在：{total:,}pt",
         ephemeral=True,
     )
@@ -1990,16 +2007,18 @@ async def admin_remove_points(
     amount: app_commands.Range[int, 1, 1000000],
     reason: str = "管理者による減少",
 ):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     success, remaining = await db.take_points(member.id, amount, reason)
 
     if not success:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"ポイント不足です。現在：{remaining:,}pt",
             ephemeral=True,
         )
         return
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ {member.mention}から**{amount:,}pt**減らしました。\n現在：{remaining:,}pt",
         ephemeral=True,
     )
@@ -2062,38 +2081,32 @@ async def settings_view(interaction: discord.Interaction):
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def database_backup(interaction: discord.Interaction):
-    # まずDiscordへ受理だけ返す
-    await interaction.response.defer(ephemeral=True)
-
-    print("[DB BACKUP] 1/3 開始", flush=True)
-    print(f"[DB BACKUP] DB PATH: {DATABASE_PATH}", flush=True)
-    print(f"[DB BACKUP] BACKUP PATH: {BACKUP_DATABASE_PATH}", flush=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
     try:
         backup_file = Path(BACKUP_DATABASE_PATH)
         backup_file.parent.mkdir(parents=True, exist_ok=True)
 
+        print("[DB BACKUP] START", flush=True)
+        print(f"[DB BACKUP] DB={DATABASE_PATH}", flush=True)
+        print(f"[DB BACKUP] DEST={BACKUP_DATABASE_PATH}", flush=True)
         print(
-            f"[DB BACKUP] parent exists={backup_file.parent.exists()} "
-            f"writable={os.access(backup_file.parent, os.W_OK)}",
+            f"[DB BACKUP] writable={os.access(backup_file.parent, os.W_OK)}",
             flush=True,
         )
 
-        print("[DB BACKUP] 2/3 SQLiteコピー開始", flush=True)
         await db.create_backup(BACKUP_DATABASE_PATH)
-
-        print("[DB BACKUP] 3/3 完了", flush=True)
 
         size = backup_file.stat().st_size
         updated_at = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
 
+        print("[DB BACKUP] DONE", flush=True)
+
         await interaction.followup.send(
-            (
-                "✅ **SQLiteバックアップが完了しました。**\n"
-                f"保存先：`{BACKUP_DATABASE_PATH}`\n"
-                f"サイズ：**{size / 1024:.1f} KB**\n"
-                f"保存日時：**{updated_at}**"
-            ),
+            "✅ **SQLiteバックアップが完了しました。**\n"
+            f"保存先：`{BACKUP_DATABASE_PATH}`\n"
+            f"サイズ：**{size / 1024:.1f} KB**\n"
+            f"保存日時：**{updated_at}**",
             ephemeral=True,
         )
 
@@ -2101,23 +2114,18 @@ async def database_backup(interaction: discord.Interaction):
         print("[DB BACKUP ERROR] TimeoutError", flush=True)
         try:
             await interaction.followup.send(
-                "❌ バックアップ処理が60秒を超えたため中止しました。",
+                "❌ バックアップが30秒以内に完了しなかったため中止しました。",
                 ephemeral=True,
             )
         except discord.HTTPException:
             pass
 
     except Exception as error:
-        print(
-            f"[DB BACKUP ERROR] {type(error).__name__}: {error}",
-            flush=True,
-        )
+        print(f"[DB BACKUP ERROR] {type(error).__name__}: {error}", flush=True)
         try:
             await interaction.followup.send(
-                (
-                    "❌ **バックアップに失敗しました。**\n"
-                    f"`{type(error).__name__}: {error}`"
-                ),
+                f"❌ **バックアップに失敗しました。**\n"
+                f"`{type(error).__name__}: {error}`",
                 ephemeral=True,
             )
         except discord.HTTPException:
@@ -2130,69 +2138,51 @@ async def database_backup(interaction: discord.Interaction):
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def database_restore(interaction: discord.Interaction):
-    # Discordへ最優先で1回だけ応答
-    await interaction.response.send_message(
-        "♻️ **バックアップデータの復元を開始しました…**",
-        ephemeral=True,
-    )
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
     backup_file = Path(BACKUP_DATABASE_PATH)
 
     if not backup_file.exists():
-        await interaction.edit_original_response(
-            content=(
-                "❌ **バックアップデータがありません。**\n"
-                f"確認先：`{BACKUP_DATABASE_PATH}`\n\n"
-                "先に `/dbバックアップ` を実行してください。"
-            )
+        await interaction.followup.send(
+            "❌ **バックアップデータがありません。**\n"
+            f"確認先：`{BACKUP_DATABASE_PATH}`\n"
+            "先に `/dbバックアップ` を実行してください。",
+            ephemeral=True,
         )
         return
 
     emergency_path = f"{DATABASE_PATH}.before_restore"
 
     try:
-        print("[DB RESTORE] 1/3 現在DBを一時退避", flush=True)
+        print("[DB RESTORE] 1/3 emergency backup", flush=True)
         await db.create_backup(emergency_path)
 
-        print("[DB RESTORE] 2/3 永続バックアップを復元", flush=True)
+        print("[DB RESTORE] 2/3 restore", flush=True)
         await db.restore_backup(BACKUP_DATABASE_PATH)
 
-        print("[DB RESTORE] 3/3 復元完了", flush=True)
+        print("[DB RESTORE] 3/3 done", flush=True)
 
-        try:
-            await interaction.edit_original_response(
-                content=(
-                    "✅ **バックアップデータを復元しました。**\n"
-                    "ポイント・券・設定などがバックアップ時点へ戻りました。\n"
-                    f"復元元：`{BACKUP_DATABASE_PATH}`"
-                )
-            )
-        except discord.HTTPException as response_error:
-            print(
-                f"[DB RESTORE RESPONSE ERROR] {response_error}",
-                flush=True,
-            )
+        await interaction.followup.send(
+            "✅ **バックアップデータを復元しました。**\n"
+            "ポイント・券・設定などがバックアップ時点へ戻りました。",
+            ephemeral=True,
+        )
 
     except asyncio.TimeoutError:
-        print("[DB RESTORE ERROR] TimeoutError", flush=True)
         try:
-            await interaction.edit_original_response(
-                content="❌ 復元処理が60秒を超えたため中止しました。"
+            await interaction.followup.send(
+                "❌ 復元処理が30秒以内に完了しなかったため中止しました。",
+                ephemeral=True,
             )
         except discord.HTTPException:
             pass
 
     except Exception as error:
-        print(
-            f"[DB RESTORE ERROR] {type(error).__name__}: {error}",
-            flush=True,
-        )
+        print(f"[DB RESTORE ERROR] {type(error).__name__}: {error}", flush=True)
         try:
-            await interaction.edit_original_response(
-                content=(
-                    "❌ **復元に失敗しました。**\n"
-                    f"`{type(error).__name__}: {error}`"
-                )
+            await interaction.followup.send(
+                f"❌ 復元失敗：`{type(error).__name__}: {error}`",
+                ephemeral=True,
             )
         except discord.HTTPException:
             pass
