@@ -2073,39 +2073,56 @@ async def database_backup(interaction: discord.Interaction):
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def database_restore(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    # 最初の応答は1回だけ。以降はこのメッセージを書き換えます。
+    await interaction.response.send_message(
+        "🔄 **バックアップデータを復元しています…**",
+        ephemeral=True,
+    )
 
     backup_file = Path(BACKUP_DATABASE_PATH)
+
     if not backup_file.exists():
-        await interaction.followup.send(
-            (
+        await interaction.edit_original_response(
+            content=(
                 "❌ バックアップデータが見つかりません。\n"
                 f"確認先：`{BACKUP_DATABASE_PATH}`"
-            ),
-            ephemeral=True,
+            )
         )
         return
 
     emergency_path = f"{DATABASE_PATH}.before_restore"
 
     try:
+        print("[DB RESTORE] 1/3 復元前DBを退避します", flush=True)
         await db.create_backup(emergency_path)
+
+        print("[DB RESTORE] 2/3 バックアップDBを復元します", flush=True)
         await db.restore_backup(BACKUP_DATABASE_PATH)
 
-        await interaction.followup.send(
-            (
+        print("[DB RESTORE] 3/3 復元完了", flush=True)
+        await interaction.edit_original_response(
+            content=(
                 "✅ **バックアップデータを復元しました。**\n"
                 "ポイント・券・設定などがバックアップ時点へ戻りました。\n"
-                "BotのDB接続も自動で再接続済みです。\n"
-                f"復元前DBは一時的に `{emergency_path}` へ退避しています。"
-            ),
-            ephemeral=True,
+                "BotのDB接続も再接続済みです。\n"
+                f"復元前DB：`{emergency_path}`"
+            )
         )
+
     except Exception as error:
-        await interaction.followup.send(
-            f"❌ 復元に失敗しました。\n`{type(error).__name__}: {error}`",
-            ephemeral=True,
+        print(
+            f"[DB RESTORE ERROR] {type(error).__name__}: {error}",
+            flush=True,
         )
+        try:
+            await interaction.edit_original_response(
+                content=(
+                    "❌ **復元に失敗しました。**\n"
+                    f"`{type(error).__name__}: {error}`"
+                )
+            )
+        except discord.HTTPException:
+            pass
 
 
 @bot.tree.command(
@@ -2185,9 +2202,12 @@ async def command_error(
             await interaction.followup.send(message, ephemeral=True)
         else:
             await interaction.response.send_message(message, ephemeral=True)
-    except discord.NotFound:
-        # 操作が期限切れの場合は、追加の返答を送らずログだけ残します。
-        print("Interaction expired before error response could be sent.", flush=True)
+    except (discord.NotFound, discord.HTTPException) as response_error:
+        # 操作期限切れ・応答済みの場合は二次エラーを出しません。
+        print(
+            f"Could not send command error response: {response_error}",
+            flush=True,
+        )
 
 
 if not TOKEN:
