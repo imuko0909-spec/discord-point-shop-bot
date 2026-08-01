@@ -588,6 +588,34 @@ def manager_only():
     return app_commands.check(predicate)
 
 
+async def ensure_deferred(interaction: discord.Interaction):
+    """まだ応答していない場合だけdeferします。"""
+    if not interaction.response.is_done():
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+
+
+async def admin_guard(interaction: discord.Interaction) -> bool:
+    """ACK後に管理者権限を確認します。"""
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.followup.send(
+            "このコマンドはサーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return False
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send(
+            "このコマンドはDiscord管理者のみ使用できます。",
+            ephemeral=True,
+        )
+        return False
+
+    return True
+
+
 async def send_log(guild: Optional[discord.Guild], title: str, description: str):
     if guild is None:
         return
@@ -863,6 +891,44 @@ intents.voice_states = True
 intents.message_content = True
 
 
+class EarlyAckCommandTree(app_commands.CommandTree):
+    EARLY_ACK_COMMANDS = {
+        "dbバックアップ",
+        "db復元",
+        "ポイント追加",
+        "ポイント減少",
+    }
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        try:
+            command_name = (
+                interaction.data.get("name")
+                if isinstance(interaction.data, dict)
+                else None
+            )
+
+            if (
+                command_name in self.EARLY_ACK_COMMANDS
+                and not interaction.response.is_done()
+            ):
+                await interaction.response.defer(
+                    ephemeral=True,
+                    thinking=True,
+                )
+                print(
+                    f"[EARLY ACK] {command_name} acknowledged",
+                    flush=True,
+                )
+        except discord.HTTPException as error:
+            print(
+                f"[EARLY ACK ERROR] {type(error).__name__}: {error}",
+                flush=True,
+            )
+            return False
+
+        return True
+
+
 class PointShopBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(FloatView())
@@ -892,7 +958,11 @@ class PointShopBot(commands.Bot):
         )
 
 
-bot = PointShopBot(command_prefix="!", intents=intents)
+bot = PointShopBot(
+    command_prefix="!",
+    intents=intents,
+    tree_cls=EarlyAckCommandTree,
+)
 
 
 @bot.event
@@ -1982,14 +2052,16 @@ async def permission_setting(
 
 
 @bot.tree.command(name="ポイント追加", description="【管理者限定】メンバーへポイントを追加します")
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def admin_add_points(
     interaction: discord.Interaction,
     member: discord.Member,
     amount: app_commands.Range[int, 1, 1000000],
     reason: str = "管理者による付与",
 ):
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await ensure_deferred(interaction)
+    if not await admin_guard(interaction):
+        return
 
     total = await award_points(member, amount, reason, interaction.channel)
 
@@ -2000,14 +2072,16 @@ async def admin_add_points(
 
 
 @bot.tree.command(name="ポイント減少", description="【管理者限定】メンバーのポイントを減らします")
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def admin_remove_points(
     interaction: discord.Interaction,
     member: discord.Member,
     amount: app_commands.Range[int, 1, 1000000],
     reason: str = "管理者による減少",
 ):
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await ensure_deferred(interaction)
+    if not await admin_guard(interaction):
+        return
 
     success, remaining = await db.take_points(member.id, amount, reason)
 
@@ -2079,9 +2153,11 @@ async def settings_view(interaction: discord.Interaction):
     name="dbバックアップ",
     description="【管理者限定】SQLiteデータを永続バックアップへ保存します",
 )
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def database_backup(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await ensure_deferred(interaction)
+    if not await admin_guard(interaction):
+        return
 
     try:
         backup_file = Path(BACKUP_DATABASE_PATH)
@@ -2136,9 +2212,11 @@ async def database_backup(interaction: discord.Interaction):
     name="db復元",
     description="【管理者限定】保存済みバックアップを動作中SQLiteへ反映します",
 )
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.default_permissions(administrator=True)
 async def database_restore(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await ensure_deferred(interaction)
+    if not await admin_guard(interaction):
+        return
 
     backup_file = Path(BACKUP_DATABASE_PATH)
 
@@ -2254,11 +2332,24 @@ async def command_error(
     interaction: discord.Interaction,
     error: app_commands.AppCommandError,
 ):
-    if isinstance(error, app_commands.CheckFailure):
-        message = "このコマンドを使用する権限がありません。"
-    else:
-        message = f"エラーが発生しました：`{type(error).__name__}`"
-        print(repr(error), flush=True)
+    print(f"[COMMAND ERROR] {repr(error)}", flush=True)
+
+    original = getattr(error, "original", None)
+
+    if isinstance(original, discord.HTTPException):
+        if getattr(original, "code", None) in (10062, 40060):
+            print(
+                "[COMMAND ERROR] Interaction expired/already acknowledged; "
+                "no second response will be sent.",
+                flush=True,
+            )
+            return
+
+    message = (
+        "このコマンドを使用する権限がありません。"
+        if isinstance(error, app_commands.CheckFailure)
+        else f"エラーが発生しました：`{type(error).__name__}`"
+    )
 
     try:
         if interaction.response.is_done():
@@ -2266,9 +2357,8 @@ async def command_error(
         else:
             await interaction.response.send_message(message, ephemeral=True)
     except discord.HTTPException as response_error:
-        # 操作期限切れ・応答済みの場合は二次エラーを出しません。
         print(
-            f"Could not send command error response: {response_error}",
+            f"[COMMAND ERROR RESPONSE FAILED] {response_error}",
             flush=True,
         )
 
