@@ -1,6 +1,7 @@
 import os
 import random
 import sqlite3
+import shutil
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -106,6 +107,7 @@ TOPICS = [
 
 class Database:
     def __init__(self, path: str):
+        self.path = path
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.lock = asyncio.Lock()
@@ -434,18 +436,23 @@ class Database:
                 backup_conn.close()
 
     async def restore_backup(self, backup_path: str):
-        """バックアップSQLiteを動作中DBへ復元します。"""
+        """バックアップSQLiteを現在DBファイルへ安全に復元します。"""
         backup_file = Path(backup_path)
         if not backup_file.exists():
             raise FileNotFoundError(str(backup_file))
 
         async with self.lock:
-            source_conn = sqlite3.connect(str(backup_file))
+            # 現在の接続を確実に閉じてからDBファイルを差し替えます。
+            self.conn.commit()
+            self.conn.close()
+
             try:
-                source_conn.backup(self.conn)
-                self.conn.commit()
+                shutil.copy2(str(backup_file), self.path)
             finally:
-                source_conn.close()
+                # 成否にかかわらずDB接続を作り直します。
+                self.conn = sqlite3.connect(self.path, check_same_thread=False)
+                self.conn.row_factory = sqlite3.Row
+                self.setup()
 
     async def save_timed_role(
         self,
@@ -2089,6 +2096,7 @@ async def database_restore(interaction: discord.Interaction):
             (
                 "✅ **バックアップデータを復元しました。**\n"
                 "ポイント・券・設定などがバックアップ時点へ戻りました。\n"
+                "BotのDB接続も自動で再接続済みです。\n"
                 f"復元前DBは一時的に `{emergency_path}` へ退避しています。"
             ),
             ephemeral=True,
