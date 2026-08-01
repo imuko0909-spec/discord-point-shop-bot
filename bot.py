@@ -589,11 +589,11 @@ def manager_only():
 
 
 async def ensure_deferred(interaction: discord.Interaction):
-    """まだ応答していない場合だけdeferします。"""
+    """まだ応答していない場合だけ処理中メッセージを返します。"""
     if not interaction.response.is_done():
-        await interaction.response.defer(
+        await interaction.response.send_message(
+            "⏳ 処理しています…",
             ephemeral=True,
-            thinking=True,
         )
 
 
@@ -911,9 +911,16 @@ class EarlyAckCommandTree(app_commands.CommandTree):
                 command_name in self.EARLY_ACK_COMMANDS
                 and not interaction.response.is_done()
             ):
-                await interaction.response.defer(
+                status_text = {
+                    "dbバックアップ": "💾 バックアップ処理を開始しました…",
+                    "db復元": "♻️ バックアップデータを復元しています…",
+                    "ポイント追加": "➕ ポイントを追加しています…",
+                    "ポイント減少": "➖ ポイントを減らしています…",
+                }.get(command_name, "⏳ 処理しています…")
+
+                await interaction.response.send_message(
+                    status_text,
                     ephemeral=True,
-                    thinking=True,
                 )
                 print(
                     f"[EARLY ACK] {command_name} acknowledged",
@@ -2065,9 +2072,8 @@ async def admin_add_points(
 
     total = await award_points(member, amount, reason, interaction.channel)
 
-    await interaction.followup.send(
-        f"✅ {member.mention}へ**{amount:,}pt**追加しました。\n現在：{total:,}pt",
-        ephemeral=True,
+    await interaction.edit_original_response(
+        content=f"✅ {member.mention}へ**{amount:,}pt**追加しました。\n現在：{total:,}pt"
     )
 
 
@@ -2092,9 +2098,8 @@ async def admin_remove_points(
         )
         return
 
-    await interaction.followup.send(
-        f"✅ {member.mention}から**{amount:,}pt**減らしました。\n現在：{remaining:,}pt",
-        ephemeral=True,
+    await interaction.edit_original_response(
+        content=f"✅ {member.mention}から**{amount:,}pt**減らしました。\n現在：{remaining:,}pt"
     )
 
 
