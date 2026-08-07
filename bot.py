@@ -934,7 +934,6 @@ class EarlyAckCommandTree(app_commands.CommandTree):
         "db復元",
         "ポイント追加",
         "ポイント減少",
-        "ショップ",
     }
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -954,7 +953,6 @@ class EarlyAckCommandTree(app_commands.CommandTree):
                     "db復元": "♻️ バックアップデータを復元しています…",
                     "ポイント追加": "➕ ポイントを追加しています…",
                     "ポイント減少": "➖ ポイントを減らしています…",
-                    "ショップ": "🛍️ ショップを開いています…",
                 }.get(command_name, "⏳ 処理しています…")
 
                 await interaction.response.send_message(
@@ -1378,205 +1376,147 @@ def item_choices():
     ]
 
 
-@bot.tree.command(
-    name="ショップ",
-    description="商品一覧・購入・券一覧・券の使用を行います",
-)
-@app_commands.choices(
-    operation=[
-        app_commands.Choice(name="🛍️ 商品一覧を見る", value="list"),
-        app_commands.Choice(name="💰 商品を購入する", value="buy"),
-        app_commands.Choice(name="🎫 所持券を見る", value="inventory"),
-        app_commands.Choice(name="✨ 券を使う", value="use"),
-    ],
-    item=item_choices(),
-)
-@app_commands.describe(
-    operation="行いたい操作",
-    item="購入または使用する商品・券",
-)
-async def shop(
-    interaction: discord.Interaction,
-    operation: app_commands.Choice[str],
-    item: Optional[app_commands.Choice[str]] = None,
-):
-    # EarlyAckCommandTreeですでに初回応答済み。
-    # 万一未応答ならここで即応答。
-    if not interaction.response.is_done():
-        await interaction.response.send_message(
-            "🛍️ ショップを開いています…",
+class ShopBuySelect(discord.ui.Select):
+    def __init__(self, owner_id: int, prices: dict[str, int]):
+        options = []
+        for key, data in ITEMS.items():
+            options.append(
+                discord.SelectOption(
+                    label=f"{data['name']} - {prices[key]:,}pt",
+                    value=key,
+                    emoji=data["emoji"],
+                    description=data["description"][:100],
+                )
+            )
+
+        super().__init__(
+            placeholder="購入する商品を選んでください",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            custom_id="point_shop:buy_select",
+        )
+        self.owner_id = owner_id
+        self.prices = prices
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "このショップパネルは開いた本人だけ操作できます。",
+                ephemeral=True,
+            )
+            return
+
+        key = self.values[0]
+        data = ITEMS[key]
+        price = self.prices[key]
+
+        await interaction.response.defer(ephemeral=True)
+
+        success, remaining = await db.take_points(
+            interaction.user.id,
+            price,
+            f"{data['name']}を購入",
+        )
+
+        if not success:
+            await interaction.followup.send(
+                f"❌ ポイント不足です。\n"
+                f"必要：**{price:,} pt**\n"
+                f"所持：**{remaining:,} pt**",
+                ephemeral=True,
+            )
+            return
+
+        await db.add_item(interaction.user.id, key)
+
+        await interaction.followup.send(
+            f"✅ {data['emoji']} **{data['name']}** を購入しました。\n"
+            f"残り：**{remaining:,} pt**",
             ephemeral=True,
         )
 
-    guild_id = interaction.guild_id or GUILD_ID
-
-    try:
-        if operation.value == "list":
-            embed = discord.Embed(
-                title="🛍️ ポイントショップ",
-                description=(
-                    "`/ショップ`で「商品を購入する」または"
-                    "「券を使う」を選んでください。"
-                ),
-                color=discord.Color.purple(),
-            )
-
-            # DB待ちで無限に固まらないよう各価格取得に上限を設定
-            for key, data in ITEMS.items():
-                price = await asyncio.wait_for(
-                    get_item_price(guild_id, key),
-                    timeout=5,
-                )
-                embed.add_field(
-                    name=f"{data['emoji']} {data['name']} — {price:,} pt",
-                    value=data["description"],
-                    inline=False,
-                )
-
-            await interaction.edit_original_response(
-                content=None,
-                embed=embed,
-            )
-            return
-
-        if operation.value == "inventory":
-            inventory_data = await asyncio.wait_for(
-                db.get_inventory(interaction.user.id),
-                timeout=5,
-            )
-            lines = [
-                f"{data['emoji']} **{data['name']}**："
-                f"{inventory_data.get(key, 0)}枚"
-                for key, data in ITEMS.items()
-            ]
-
-            await interaction.edit_original_response(
-                content=None,
-                embed=discord.Embed(
-                    title="🎫 所持券一覧",
-                    description="\n".join(lines),
-                    color=discord.Color.blurple(),
+        asyncio.create_task(
+            send_log(
+                interaction.guild,
+                "🛍️ ショップ購入",
+                (
+                    f"購入者：{interaction.user.mention}\n"
+                    f"商品：{data['name']}\n"
+                    f"価格：{price:,}pt"
                 ),
             )
-            return
+        )
 
-        if item is None:
-            await interaction.edit_original_response(
-                content="購入または使用する商品・券も選択してください。",
-                embed=None,
+
+class ShopUseSelect(discord.ui.Select):
+    def __init__(self, owner_id: int):
+        options = []
+        for key, data in ITEMS.items():
+            options.append(
+                discord.SelectOption(
+                    label=data["name"],
+                    value=key,
+                    emoji=data["emoji"],
+                    description=data["description"][:100],
+                )
+            )
+
+        super().__init__(
+            placeholder="使用する券を選んでください",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            custom_id="point_shop:use_select",
+        )
+        self.owner_id = owner_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "このショップパネルは開いた本人だけ操作できます。",
+                ephemeral=True,
             )
             return
 
-        key = item.value
+        key = self.values[0]
         data = ITEMS[key]
 
-        if operation.value == "buy":
-            price = await asyncio.wait_for(
-                get_item_price(guild_id, key),
-                timeout=5,
-            )
-            success, remaining = await asyncio.wait_for(
-                db.take_points(
-                    interaction.user.id,
-                    price,
-                    f"{data['name']}を購入",
-                ),
-                timeout=5,
-            )
-
-            if not success:
-                await interaction.edit_original_response(
-                    content=(
-                        "❌ ポイント不足です。\n"
-                        f"必要：**{price:,} pt**\n"
-                        f"所持：**{remaining:,} pt**"
-                    ),
-                    embed=None,
-                )
-                return
-
-            await asyncio.wait_for(
-                db.add_item(interaction.user.id, key),
-                timeout=5,
-            )
-
-            await interaction.edit_original_response(
-                content=(
-                    f"✅ {data['emoji']} **{data['name']}** を購入しました。\n"
-                    f"残り：**{remaining:,} pt**"
-                ),
-                embed=None,
-            )
-
-            # ログ送信はショップ結果の返答後に行う
-            asyncio.create_task(
-                send_log(
-                    interaction.guild,
-                    "🛍️ ショップ購入",
-                    (
-                        f"購入者：{interaction.user.mention}\n"
-                        f"商品：{data['name']}\n"
-                        f"価格：{price:,}pt"
-                    ),
-                )
-            )
-            return
-
-        # operation == use
-        quantity = await asyncio.wait_for(
-            db.get_item_quantity(interaction.user.id, key),
-            timeout=5,
-        )
+        quantity = await db.get_item_quantity(interaction.user.id, key)
         if quantity <= 0:
-            await interaction.edit_original_response(
-                content=f"{data['name']}を所持していません。",
-                embed=None,
+            await interaction.response.send_message(
+                f"{data['name']}を所持していません。",
+                ephemeral=True,
             )
             return
 
         if key == "topic":
-            await asyncio.wait_for(
-                db.consume_item(interaction.user.id, key),
-                timeout=5,
-            )
-            await interaction.edit_original_response(
-                content=None,
+            await db.consume_item(interaction.user.id, key)
+            await interaction.response.send_message(
                 embed=discord.Embed(
                     title="🎲 話題ガチャ",
                     description=f"## {random.choice(TOPICS)}",
                     color=discord.Color.random(),
-                ),
+                )
             )
             return
 
         if key == "private_room":
-            success, message = await asyncio.wait_for(
-                create_private_room(interaction),
-                timeout=10,
-            )
-
+            await interaction.response.defer(ephemeral=True)
+            success, message = await create_private_room(interaction)
             if not success:
-                await interaction.edit_original_response(
-                    content=message,
-                    embed=None,
-                )
+                await interaction.followup.send(message, ephemeral=True)
                 return
 
-            await asyncio.wait_for(
-                db.consume_item(interaction.user.id, key),
-                timeout=5,
-            )
-            await interaction.edit_original_response(
-                content=message,
-                embed=None,
-            )
+            await db.consume_item(interaction.user.id, key)
+            await interaction.followup.send(message, ephemeral=True)
             return
 
         if key == "game_role":
-            await interaction.edit_original_response(
-                content="付与するゲームロールを選択してください。",
-                embed=None,
+            await interaction.response.send_message(
+                "付与するゲームロールを選択してください。",
                 view=GameRoleView(interaction.user.id),
+                ephemeral=True,
             )
             return
 
@@ -1585,17 +1525,17 @@ async def shop(
                 interaction.user,
                 discord.Member,
             ):
-                await interaction.edit_original_response(
-                    content="サーバー内で使用してください。",
-                    embed=None,
+                await interaction.response.send_message(
+                    "サーバー内で使用してください。",
+                    ephemeral=True,
                 )
                 return
 
             role = interaction.guild.get_role(SECRET_ROLE_ID)
             if role is None:
-                await interaction.edit_original_response(
-                    content="シークレットロールが見つかりません。",
-                    embed=None,
+                await interaction.response.send_message(
+                    "シークレットロールが見つかりません。",
+                    ephemeral=True,
                 )
                 return
 
@@ -1607,92 +1547,132 @@ async def shop(
                     reason="シークレット券を使用",
                 )
             except discord.Forbidden:
-                await interaction.edit_original_response(
-                    content=(
-                        "Botのロールをシークレットロールより"
-                        "上にしてください。"
-                    ),
-                    embed=None,
+                await interaction.response.send_message(
+                    "Botのロールをシークレットロールより上にしてください。",
+                    ephemeral=True,
                 )
                 return
 
-            await asyncio.wait_for(
-                db.consume_item(interaction.user.id, key),
-                timeout=5,
-            )
-            await asyncio.wait_for(
-                db.save_timed_role(
-                    interaction.guild.id,
-                    interaction.user.id,
-                    role.id,
-                    expires_at,
-                ),
-                timeout=5,
+            await db.consume_item(interaction.user.id, key)
+            await db.save_timed_role(
+                interaction.guild.id,
+                interaction.user.id,
+                role.id,
+                expires_at,
             )
 
-            await interaction.edit_original_response(
-                content=(
-                    f"🕯️ {role.mention} を付与しました。\n"
-                    f"有効期限：<t:{int(expires_at.timestamp())}:F>\n"
-                    f"期限まで：<t:{int(expires_at.timestamp())}:R>"
-                ),
-                embed=None,
-            )
-
-            asyncio.create_task(
-                send_log(
-                    interaction.guild,
-                    "🕯️ シークレット券使用",
-                    (
-                        f"使用者：{interaction.user.mention}\n"
-                        f"ロール：{role.mention}\n"
-                        f"期限：<t:{int(expires_at.timestamp())}:F>"
-                    ),
-                )
+            await interaction.response.send_message(
+                f"🕯️ {role.mention} を付与しました。\n"
+                f"期限まで：<t:{int(expires_at.timestamp())}:R>",
+                ephemeral=True,
             )
             return
 
         if key == "date":
-            await interaction.edit_original_response(
-                content=(
-                    "デート券は `/デート券を使う` から"
-                    "相手を選んで使用してください。"
-                ),
-                embed=None,
+            await interaction.response.send_message(
+                "デート券は `/デート券を使う` から相手を選んで使用してください。",
+                ephemeral=True,
             )
             return
 
-    except asyncio.TimeoutError:
-        print("[SHOP ERROR] database operation timeout", flush=True)
-        try:
-            await interaction.edit_original_response(
-                content=(
-                    "❌ ショップ処理がタイムアウトしました。\n"
-                    "データベースが処理中の可能性があります。"
-                    "少し待ってからもう一度お試しください。"
-                ),
-                embed=None,
-                view=None,
-            )
-        except discord.HTTPException:
-            pass
 
+class ShopView(discord.ui.View):
+    def __init__(self, owner_id: int, prices: dict[str, int]):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.add_item(ShopBuySelect(owner_id, prices))
+        self.add_item(ShopUseSelect(owner_id))
+
+    @discord.ui.button(
+        label="所持券を見る",
+        emoji="🎫",
+        style=discord.ButtonStyle.secondary,
+        custom_id="point_shop:inventory_button",
+    )
+    async def inventory_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "このショップパネルは開いた本人だけ操作できます。",
+                ephemeral=True,
+            )
+            return
+
+        inventory_data = await db.get_inventory(interaction.user.id)
+        lines = [
+            f"{data['emoji']} **{data['name']}**："
+            f"{inventory_data.get(key, 0)}枚"
+            for key, data in ITEMS.items()
+        ]
+
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🎫 所持券一覧",
+                description="\n".join(lines),
+                color=discord.Color.blurple(),
+            ),
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="ショップ",
+    description="商品一覧・購入・券一覧・券の使用を行います",
+)
+async def shop(interaction: discord.Interaction):
+    # 最初に即応答し、商品一覧を作成します。
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    guild_id = interaction.guild_id or GUILD_ID
+
+    try:
+        prices = {}
+        for key in ITEMS:
+            prices[key] = await asyncio.wait_for(
+                get_item_price(guild_id, key),
+                timeout=5,
+            )
+
+        embed = discord.Embed(
+            title="🛍️ ポイントショップ",
+            description=(
+                "下のメニューから商品を購入できます。\n"
+                "券を使う場合は2つ目のメニューを選んでください。"
+            ),
+            color=discord.Color.purple(),
+        )
+
+        for key, data in ITEMS.items():
+            embed.add_field(
+                name=f"{data['emoji']} {data['name']} — {prices[key]:,} pt",
+                value=data["description"],
+                inline=False,
+            )
+
+        await interaction.followup.send(
+            embed=embed,
+            view=ShopView(interaction.user.id, prices),
+            ephemeral=True,
+        )
+
+    except asyncio.TimeoutError:
+        await interaction.followup.send(
+            "❌ ショップの読み込みに時間がかかっています。少し待ってもう一度お試しください。",
+            ephemeral=True,
+        )
     except Exception as error:
         print(
             f"[SHOP ERROR] {type(error).__name__}: {error}",
             flush=True,
         )
-        try:
-            await interaction.edit_original_response(
-                content=(
-                    "❌ ショップでエラーが発生しました。\n"
-                    f"`{type(error).__name__}: {error}`"
-                ),
-                embed=None,
-                view=None,
-            )
-        except discord.HTTPException:
-            pass
+        await interaction.followup.send(
+            f"❌ ショップでエラーが発生しました。\n"
+            f"`{type(error).__name__}: {error}`",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(name="デート券を使う", description="相手へデートのお誘いを送ります")
