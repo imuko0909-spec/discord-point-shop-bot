@@ -1647,29 +1647,62 @@ class ShopView(discord.ui.View):
     description="商品購入・券一覧・券の使用を行います",
 )
 async def shop(interaction: discord.Interaction):
-    # DBを読まず、3秒以内に必ずショップパネルを返します。
-    embed = discord.Embed(
-        title="🛍️ ポイントショップ",
-        description=(
-            "下のメニューから購入する商品を選んでください。\n"
-            "券を使う場合は2つ目のメニューを選択してください。\n"
-            "所持券はボタンから確認できます。"
-        ),
-        color=discord.Color.purple(),
-    )
+    # まず即応答して、Discordの3秒制限を回避
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
-    for data in ITEMS.values():
-        embed.add_field(
-            name=f"{data['emoji']} {data['name']}",
-            value=data["description"],
-            inline=False,
+    guild_id = interaction.guild_id or GUILD_ID
+
+    try:
+        prices = {}
+
+        # 商品価格だけ取得
+        for key, data in ITEMS.items():
+            try:
+                prices[key] = await asyncio.wait_for(
+                    get_item_price(guild_id, key),
+                    timeout=2,
+                )
+            except asyncio.TimeoutError:
+                prices[key] = int(data["default_price"])
+
+        embed = discord.Embed(
+            title="🛍️ ポイントショップ",
+            description=(
+                "下のメニューから購入する商品を選んでください。\n"
+                "券を使う場合は2つ目のメニューを選択してください。\n"
+                "所持券はボタンから確認できます。"
+            ),
+            color=discord.Color.purple(),
         )
 
-    await interaction.response.send_message(
-        embed=embed,
-        view=ShopView(interaction.user.id),
-        ephemeral=True,
-    )
+        for key, data in ITEMS.items():
+            embed.add_field(
+                name=(
+                    f"{data['emoji']} {data['name']} "
+                    f"— **{prices[key]:,} pt**"
+                ),
+                value=data["description"],
+                inline=False,
+            )
+
+        await interaction.followup.send(
+            embed=embed,
+            view=ShopView(interaction.user.id),
+            ephemeral=True,
+        )
+
+    except Exception as error:
+        print(
+            f"[SHOP OPEN ERROR] {type(error).__name__}: {error}",
+            flush=True,
+        )
+        try:
+            await interaction.followup.send(
+                f"❌ ショップ表示エラー：`{type(error).__name__}: {error}`",
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            pass
 
 
 @bot.tree.command(name="デート券を使う", description="相手へデートのお誘いを送ります")
