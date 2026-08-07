@@ -1377,7 +1377,7 @@ def item_choices():
 
 
 class ShopBuySelect(discord.ui.Select):
-    def __init__(self, owner_id: int):
+    def __init__(self):
         options = []
         for key, data in ITEMS.items():
             options.append(
@@ -1396,16 +1396,7 @@ class ShopBuySelect(discord.ui.Select):
             options=options[:25],
             custom_id="point_shop:buy_select",
         )
-        self.owner_id = owner_id
-
     async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                "このショップパネルは開いた本人だけ操作できます。",
-                ephemeral=True,
-            )
-            return
-
         key = self.values[0]
         data = ITEMS[key]
         guild_id = interaction.guild_id or GUILD_ID
@@ -1474,7 +1465,7 @@ class ShopBuySelect(discord.ui.Select):
 
 
 class ShopUseSelect(discord.ui.Select):
-    def __init__(self, owner_id: int):
+    def __init__(self):
         options = []
         for key, data in ITEMS.items():
             options.append(
@@ -1493,16 +1484,7 @@ class ShopUseSelect(discord.ui.Select):
             options=options[:25],
             custom_id="point_shop:use_select",
         )
-        self.owner_id = owner_id
-
     async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                "このショップパネルは開いた本人だけ操作できます。",
-                ephemeral=True,
-            )
-            return
-
         key = self.values[0]
         data = ITEMS[key]
 
@@ -1601,11 +1583,11 @@ class ShopUseSelect(discord.ui.Select):
 
 
 class ShopView(discord.ui.View):
-    def __init__(self, owner_id: int):
-        super().__init__(timeout=300)
-        self.owner_id = owner_id
-        self.add_item(ShopBuySelect(owner_id))
-        self.add_item(ShopUseSelect(owner_id))
+    def __init__(self):
+        # 公開ショップなので複数人が同じパネルを操作できます。
+        super().__init__(timeout=3600)
+        self.add_item(ShopBuySelect())
+        self.add_item(ShopUseSelect())
 
     @discord.ui.button(
         label="所持券を見る",
@@ -1618,14 +1600,8 @@ class ShopView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                "このショップパネルは開いた本人だけ操作できます。",
-                ephemeral=True,
-            )
-            return
-
         inventory_data = await db.get_inventory(interaction.user.id)
+
         lines = [
             f"{data['emoji']} **{data['name']}**："
             f"{inventory_data.get(key, 0)}枚"
@@ -1634,7 +1610,7 @@ class ShopView(discord.ui.View):
 
         await interaction.response.send_message(
             embed=discord.Embed(
-                title="🎫 所持券一覧",
+                title=f"🎫 {interaction.user.display_name}の所持券",
                 description="\n".join(lines),
                 color=discord.Color.blurple(),
             ),
@@ -1644,18 +1620,15 @@ class ShopView(discord.ui.View):
 
 @bot.tree.command(
     name="ショップ",
-    description="商品購入・券一覧・券の使用を行います",
+    description="みんなが使えるショップパネルを表示します",
 )
 async def shop(interaction: discord.Interaction):
-    # まず即応答して、Discordの3秒制限を回避
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
+    # 価格を取得して公開ショップパネルを表示
     guild_id = interaction.guild_id or GUILD_ID
 
     try:
         prices = {}
 
-        # 商品価格だけ取得
         for key, data in ITEMS.items():
             try:
                 prices[key] = await asyncio.wait_for(
@@ -1668,9 +1641,9 @@ async def shop(interaction: discord.Interaction):
         embed = discord.Embed(
             title="🛍️ ポイントショップ",
             description=(
-                "下のメニューから購入する商品を選んでください。\n"
-                "券を使う場合は2つ目のメニューを選択してください。\n"
-                "所持券はボタンから確認できます。"
+                "購入したい商品を下のメニューから選んでください。\n"
+                "このショップは**全員が利用できます**。\n"
+                "購入結果・所持券・券の使用結果は本人だけに表示されます。"
             ),
             color=discord.Color.purple(),
         )
@@ -1685,10 +1658,9 @@ async def shop(interaction: discord.Interaction):
                 inline=False,
             )
 
-        await interaction.followup.send(
+        await interaction.response.send_message(
             embed=embed,
-            view=ShopView(interaction.user.id),
-            ephemeral=True,
+            view=ShopView(),
         )
 
     except Exception as error:
@@ -1696,13 +1668,17 @@ async def shop(interaction: discord.Interaction):
             f"[SHOP OPEN ERROR] {type(error).__name__}: {error}",
             flush=True,
         )
-        try:
+
+        if interaction.response.is_done():
             await interaction.followup.send(
                 f"❌ ショップ表示エラー：`{type(error).__name__}: {error}`",
                 ephemeral=True,
             )
-        except discord.HTTPException:
-            pass
+        else:
+            await interaction.response.send_message(
+                f"❌ ショップ表示エラー：`{type(error).__name__}: {error}`",
+                ephemeral=True,
+            )
 
 
 @bot.tree.command(name="デート券を使う", description="相手へデートのお誘いを送ります")
